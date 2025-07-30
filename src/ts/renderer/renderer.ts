@@ -1,6 +1,6 @@
 import { GameConfig } from '../replay_loader/config.js';
 import { formatObjectData, getBarMetrics, type TickObject } from '../replay_loader/object.js';
-import { getGameConfig, getGameMisc, getNameOfUnitType, getStateAt } from '../replay_loader/replayLoader.js';
+import { getActionsByExecutor, getGameConfig, getGameMisc, getNameOfUnitType, getStateAt } from '../replay_loader/replayLoader.js';
 import { getCurrentTickData } from '../time_manager/timeManager.js';
 
 const svgNS = 'http://www.w3.org/2000/svg';
@@ -39,6 +39,13 @@ const svgAssets = {
 	4: 'money.svg',
 	5: 'core.svg',
 } as const;
+const unitAngles: { unitType: string; attackAngle: number; interactAngle: number }[] = [
+	{ unitType: 'Warrior', attackAngle: 45, interactAngle: 135 },
+	{ unitType: 'Miner', attackAngle: 45, interactAngle: 135 },
+	{ unitType: 'Builder', attackAngle: 45, interactAngle: 135 },
+	{ unitType: 'Carrier', attackAngle: -1, interactAngle: 0 },
+	{ unitType: 'Bomberman', attackAngle: -1, interactAngle: 0 },
+];
 
 const svgCanvasElement = document.getElementById('svg-canvas');
 if (!svgCanvasElement || !(svgCanvasElement instanceof SVGSVGElement)) {
@@ -51,7 +58,7 @@ const teamTwoElement = document.getElementById('team-two-name') as HTMLDivElemen
 
 let gameConfig: GameConfig | undefined;
 
-function drawObject(obj: TickObject, xOffset: number = 0, yOffset: number = 0, scaleFactor: number = 1): void {
+function drawObject(obj: TickObject, xOffset: number = 0, yOffset: number = 0, scaleFactor: number = 1, rotation: number = 0): void {
 	if (!gameConfig) {
 		throw new Error('Game configuration not found. Cannot draw objects.');
 	}
@@ -140,13 +147,16 @@ function drawObject(obj: TickObject, xOffset: number = 0, yOffset: number = 0, s
 	img.removeAttribute('y');
 	img.setAttribute('width', '1');
 	img.setAttribute('height', '1');
-	img.setAttribute('transform', `translate(${xOffset + offset},${yOffset + offset}) scale(${scale * scaleFactor})`);
+	img.setAttribute('transform', `translate(${xOffset + offset},${yOffset + offset}) rotate(${rotation} 0.5 0.5) scale(${scale * scaleFactor})`);
 	svgCanvas.appendChild(img);
 }
 
 function drawFrame(_timestamp: number): void {
 	const currentTickData = getCurrentTickData();
 	const replayData = getStateAt(currentTickData.tick);
+	const actionsByExec = getActionsByExecutor(currentTickData.tick);
+	const actionsByPrev = getActionsByExecutor(currentTickData.tick - 1);
+	const actionsByNext = getActionsByExecutor(currentTickData.tick + 1);
 	if (!replayData) {
 		console.warn('No replay data available for the current tick.');
 		window.requestAnimationFrame(drawFrame);
@@ -161,6 +171,7 @@ function drawFrame(_timestamp: number): void {
 
 	for (const currObj of replayData.objects) {
 		let scale = 1;
+		let rotation = 0;
 		let x = currObj.x;
 		let y = currObj.y;
 
@@ -187,7 +198,55 @@ function drawFrame(_timestamp: number): void {
 			y = currObj.y + (nextObj.y - currObj.y) * sineProgress;
 		}
 
-		drawObject(currObj, x, y, scale);
+		if (currObj.type === 1) {
+			// animations with rotation
+			const execAction = (actionsByExec[currObj.id] ?? []).find((a) => a.type === 'attack' || a.type === 'build' || a.type === 'transfer_money');
+			const prevAction = (actionsByPrev[currObj.id] ?? []).find((a) => a.type === 'attack' || a.type === 'build' || a.type === 'transfer_money');
+			const nextAction = (actionsByNext[currObj.id] ?? []).find((a) => a.type === 'attack' || a.type === 'build' || a.type === 'transfer_money');
+			// wind up to animation
+			if (nextAction) {
+				const isAttack: boolean = nextAction.type === 'attack';
+				const unitName = getNameOfUnitType(currObj.unit_type);
+				const angleEntry = unitAngles.find((a) => a.unitType === unitName);
+				if (angleEntry) {
+					const baseAngle = isAttack ? angleEntry.attackAngle : angleEntry.interactAngle;
+					rotation = (baseAngle * sineProgress) % 360;
+					if (baseAngle) {
+						rotation = (baseAngle * sineProgress) % 360;
+					}
+				}
+			}
+			// animation
+			else if (execAction) {
+				const isAttack: boolean = execAction.type === 'attack';
+				const unitName = getNameOfUnitType(currObj.unit_type);
+				const angleEntry = unitAngles.find((a) => a.unitType === unitName);
+				if (angleEntry) {
+					const baseAngle = isAttack ? angleEntry.attackAngle : angleEntry.interactAngle;
+					rotation = baseAngle % 360;
+				}
+				const p = currentTickData.tickProgress;
+				const f = p <= 0.5 ? p * 2 : (1 - p) * 2;
+				const { x: tx, y: ty } = execAction;
+				x += (tx - currObj.x) * 0.5 * f;
+				y += (ty - currObj.y) * 0.5 * f;
+			}
+			// wind down from animation
+			else if (prevAction) {
+				const isAttack: boolean = prevAction.type === 'attack';
+				const unitName = getNameOfUnitType(currObj.unit_type);
+				const angleEntry = unitAngles.find((a) => a.unitType === unitName);
+				if (angleEntry) {
+					const baseAngle = isAttack ? angleEntry.attackAngle : angleEntry.interactAngle;
+					rotation = (baseAngle * sineProgress) % 360;
+					if (baseAngle) {
+						rotation = (baseAngle * (1 - sineProgress)) % 360;
+					}
+				}
+			}
+		}
+
+		drawObject(currObj, x, y, scale, rotation);
 	}
 
 	for (const element of svgCanvas.querySelectorAll('.not-touched')) {
