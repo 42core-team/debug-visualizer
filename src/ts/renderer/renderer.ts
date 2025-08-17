@@ -1,7 +1,7 @@
 import type { GameConfig } from '../replay_loader/config.js';
 import { formatObjectData, getBarMetrics, type TickObject } from '../replay_loader/object.js';
 import { getActionsByExecutor, getGameConfig, getGameMisc, getNameOfUnitType, getStateAt } from '../replay_loader/replayLoader.js';
-import { getCurrentTickData } from '../time_manager/timeManager.js';
+import { getCurrentTickData, isDirty } from '../time_manager/timeManager.js';
 
 const svgNS = 'http://www.w3.org/2000/svg';
 const xlinkNS = 'http://www.w3.org/1999/xlink';
@@ -12,8 +12,7 @@ const svgAssets = {
 		0: 'cores/1.svg',
 		1: 'cores/2.svg',
 	},
-	1: {
-	},
+	1: {},
 	2: 'resource.svg',
 	3: 'wall.svg',
 	4: 'money.svg',
@@ -30,22 +29,30 @@ const teamOneElement = document.getElementById('team-one-name') as HTMLDivElemen
 const teamTwoElement = document.getElementById('team-two-name') as HTMLDivElement;
 
 let gameConfig: GameConfig | undefined;
-const teamIdMapping: Map<number, AssetTeam> = new Map();
+const teamIdMapping: Map<number, AssetTeam> = new Map(); // number / asset id
 
-export function initializeTeamMapping(): void {
+function initializeTeamMapping(): void {
 	teamIdMapping.clear();
-	const firstTickObjects = getStateAt(0)?.objects ?? [];
-	const coreObjects = firstTickObjects.filter(obj => obj.type === 0);
+	const objs = getStateAt(0)?.objects ?? [];
+	const cores = objs.filter((o) => o.type === 0);
+	if (cores.length < 2) return;
 
-	coreObjects.forEach((core, index) => {
-		if (core.teamId !== undefined && index < 2) {
-			teamIdMapping.set(core.teamId, index as AssetTeam);
-		}
-	});
+	cores.sort((a, b) => a.x - b.x || a.y - b.y);
+	const leftCore = cores[0];
+	const rightCore = cores[1];
+
+	const flip = Math.random() < 0.5;
+	const teamForLight = flip ? leftCore.teamId : rightCore.teamId;
+	const teamForDark = flip ? rightCore.teamId : leftCore.teamId;
+
+	if (teamForLight !== undefined) teamIdMapping.set(teamForLight, 1);
+	if (teamForDark !== undefined) teamIdMapping.set(teamForDark, 0);
 }
 
 function getTeamIndex(teamId: number | undefined): AssetTeam {
-	if (teamId === undefined) { return 0; }
+	if (teamId === undefined) {
+		return 0;
+	}
 	return teamIdMapping.get(teamId) ?? 0;
 }
 
@@ -120,6 +127,10 @@ function drawObject(obj: TickObject, xOffset: number = 0, yOffset: number = 0, s
 	}
 
 	img.classList.remove('not-touched');
+	img.classList.remove('team-0', 'team-1');
+	if (obj.type === 0 || obj.type === 1) {
+		img.classList.add(`team-${getTeamIndex(obj.teamId)}`);
+	}
 	img.setAttributeNS(xlinkNS, 'href', `/assets/object-svgs/${path}`);
 
 	let scale = 0.8;
@@ -154,8 +165,15 @@ function scheduleNextFrame(): void {
 		window.requestAnimationFrame(drawFrame);
 	}
 }
+let isInitialRender = true;
 function drawFrame(timestamp: number): void {
 	lastRenderTime = timestamp;
+
+	if (!isDirty() && !isInitialRender) {
+		scheduleNextFrame();
+		return;
+	}
+	isInitialRender = false;
 
 	const currentTickData = getCurrentTickData();
 	const replayData = getStateAt(currentTickData.tick);
@@ -180,11 +198,11 @@ function drawFrame(timestamp: number): void {
 		let prevObj = null;
 		try {
 			if (currentTickData.tick - 1 >= 0) prevObj = getStateAt(currentTickData.tick - 1)?.objects.find((o) => o.id === currObj.id);
-		} catch { }
+		} catch {}
 		let nextObj = null;
 		try {
 			nextObj = getStateAt(currentTickData.tick + 1)?.objects.find((o) => o.id === currObj.id);
-		} catch { }
+		} catch {}
 
 		const sineProgress = Math.sin((currentTickData.tickProgress * Math.PI) / 2);
 
@@ -235,7 +253,6 @@ function drawFrame(timestamp: number): void {
 
 	scheduleNextFrame();
 }
-scheduleNextFrame();
 
 let lastSVGPoint: DOMPoint | null = null;
 let lastClientX = 0;
@@ -247,16 +264,16 @@ function refreshTooltipFromSVGPoint(svgP: DOMPoint, clientX: number, clientY: nu
 	const currentObjects = getStateAt(getCurrentTickData().tick)?.objects || [];
 	const obj = currentObjects.find((o: TickObject) => o.x === tx && o.y === ty);
 
+	const offsetX = 10;
+	const offsetY = clientY > window.innerHeight / 2 ? -tooltipElement.offsetHeight - 10 : 10;
+	tooltipElement.style.left = `${clientX + offsetX}px`;
+	tooltipElement.style.top = `${clientY + offsetY}px`;
+	tooltipElement.style.borderRadius = clientY > window.innerHeight / 2 ? '15px 15px 15px 0' : '0 15px 15px 15px';
+	tooltipElement.style.display = 'block';
 	if (obj) {
-		const offsetX = 10;
-		const offsetY = clientY > window.innerHeight / 2 ? -tooltipElement.offsetHeight - 10 : 10;
-		tooltipElement.style.left = `${clientX + offsetX}px`;
-		tooltipElement.style.top = `${clientY + offsetY}px`;
-		tooltipElement.style.borderRadius = clientY > window.innerHeight / 2 ? '15px 15px 15px 0' : '0 15px 15px 15px';
-		tooltipElement.style.display = 'block';
 		tooltipElement.innerHTML = formatObjectData(obj);
 	} else {
-		tooltipElement.style.display = 'none';
+		tooltipElement.innerHTML = `📍 Position: [${tx}, ${ty}]`;
 	}
 }
 export async function setupRenderer(): Promise<void> {
@@ -265,21 +282,37 @@ export async function setupRenderer(): Promise<void> {
 		throw new Error('Game configuration not found. Cannot set up renderer.');
 	}
 
-	for (const team of getGameMisc()?.team_results ?? []) {
-		for (const obj of getStateAt(0)?.objects ?? []) {
-			if (obj.type === 0 && obj.teamId === team.id) {
-				if (obj.x === 0) teamOneElement.textContent = `${team.name}(${team.id})`;
-				else if (obj.x === gameConfig.gridSize - 1) teamTwoElement.textContent = `${team.name}(${team.id})`;
+	if (!(svgCanvas as any).dataset.renderLoopStarted) {
+		scheduleNextFrame();
+		(svgCanvas as any).dataset.renderLoopStarted = '1';
+	}
+
+	teamOneElement.textContent = '';
+	teamTwoElement.textContent = '';
+
+	if ((getStateAt(0)?.objects ?? []).some((o) => o.type === 0)) {
+		for (const team of getGameMisc()?.team_results ?? []) {
+			for (const obj of getStateAt(0)?.objects ?? []) {
+				if (obj.type === 0 && obj.teamId === team.id) {
+					if (obj.x === 0) teamOneElement.textContent = `${team.name}(${team.id})`;
+					else if (obj.x === gameConfig.gridSize - 1) teamTwoElement.textContent = `${team.name}(${team.id})`;
+				}
 			}
 		}
+	} else {
+		const misc = getGameMisc();
+		if (misc?.team_results?.[0]) teamOneElement.textContent = `${misc.team_results[0].name}(${misc.team_results[0].id})`;
+		if (misc?.team_results?.[1]) teamTwoElement.textContent = `${misc.team_results[1].name}(${misc.team_results[1].id})`;
 	}
+
+	svgCanvas.querySelectorAll('.persistent').forEach((el) => el.remove());
+	svgCanvas.querySelectorAll(':not(.persistent)').forEach((el) => el.remove());
 
 	const gridSize = gameConfig.gridSize;
 	svgCanvas.setAttribute('width', gridSize.toString());
 	svgCanvas.setAttribute('height', gridSize.toString());
 	svgCanvas.setAttribute('viewBox', `0 0 ${gridSize} ${gridSize}`);
 
-	// populate with chess tiles
 	for (let y = 0; y < gridSize; y++) {
 		for (let x = 0; x < gridSize; x++) {
 			const rect = document.createElementNS(svgNS, 'rect');
@@ -295,30 +328,36 @@ export async function setupRenderer(): Promise<void> {
 		}
 	}
 
-	svgCanvas.addEventListener('mousemove', (e) => {
-		const pt = svgCanvas.createSVGPoint();
-		pt.x = e.clientX;
-		pt.y = e.clientY;
+	initializeTeamMapping();
 
-		const ctm = svgCanvas.getScreenCTM();
-		if (!ctm) {
+	if (!(svgCanvas as any).dataset.listenersBound) {
+		svgCanvas.addEventListener('mousemove', (e) => {
+			const pt = svgCanvas.createSVGPoint();
+			pt.x = e.clientX;
+			pt.y = e.clientY;
+			const ctm = svgCanvas.getScreenCTM();
+			if (!ctm) {
+				tooltipElement.style.display = 'none';
+				return;
+			}
+			const svgP = pt.matrixTransform(ctm.inverse());
+			lastSVGPoint = svgP;
+			lastClientX = e.pageX;
+			lastClientY = e.pageY;
+			refreshTooltipFromSVGPoint(svgP, e.clientX, e.clientY);
+		});
+		const hideIfOutside = (e: MouseEvent) => {
+			const rect = svgCanvas.getBoundingClientRect();
+			if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) {
+				tooltipElement.style.display = 'none';
+			}
+		};
+		document.addEventListener('mousemove', hideIfOutside);
+		window.addEventListener('blur', () => {
 			tooltipElement.style.display = 'none';
-			return;
-		}
-		const svgP = pt.matrixTransform(ctm.inverse());
+		});
+		(svgCanvas as any).dataset.listenersBound = '1';
+	}
 
-		lastSVGPoint = svgP;
-		lastClientX = e.pageX;
-		lastClientY = e.pageY;
-
-		refreshTooltipFromSVGPoint(svgP, e.clientX, e.clientY);
-	});
-	const hideIfOutside = (e: MouseEvent) => {
-		const rect = svgCanvas.getBoundingClientRect();
-		if (e.clientX < rect.left || e.clientX > rect.right || e.clientY < rect.top || e.clientY > rect.bottom) {
-			tooltipElement.style.display = 'none';
-		}
-	};
-	document.addEventListener('mousemove', hideIfOutside);
-	window.addEventListener('blur', () => { tooltipElement.style.display = 'none'; });
+	isInitialRender = true;
 }

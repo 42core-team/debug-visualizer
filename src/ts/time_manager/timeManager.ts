@@ -35,6 +35,7 @@ export type tickData = {
 let playing: boolean = false;
 let tick: number = 0;
 let speedApS: number = 5; // Actions per Second
+let renderDirty: boolean = true; // true when a rendering-update worthy change has occurred
 
 // Live playback state
 let lastTimestamp: number | null = null;
@@ -50,6 +51,7 @@ function setTick(tickValue: number) {
 	tick = tickValue;
 	tickTimelineSlider.value = tick.toString();
 	tickTimelineNumberInput.value = tick.toString();
+	renderDirty = true;
 }
 function setPlaying(isPlaying: boolean) {
 	playing = isPlaying;
@@ -62,91 +64,105 @@ function setPlaying(isPlaying: boolean) {
 // External Functions
 
 export async function setupTimeManager() {
-	tickTimelineSlider.max = (getTotalTicks() - 1).toString();
-	tickTimelineNumberInput.max = (getTotalTicks() - 1).toString();
-	setTick(0);
+	const total = Math.max(1, getTotalTicks());
+	const s = parseFloat(localStorage.getItem('tm.speed') || '');
+	if (!Number.isNaN(s)) {
+		const stepped = Math.round(s / speedIncrement) * speedIncrement;
+		speedApS = Math.min(maxSpeed, Math.max(minSpeed, stepped));
+	}
+	tick = 0;
+	tickTimelineSlider.max = String(total - 1);
+	tickTimelineNumberInput.max = String(total - 1);
+	tickTimelineSlider.value = '0';
+	tickTimelineNumberInput.value = '0';
+	speedSlider.value = String(speedApS);
+	speedNumberInput.value = String(speedApS);
 
-	// Setup event listeners
+	function setSpeedLocal(v: number) {
+		const stepped = Math.round(v / speedIncrement) * speedIncrement;
+		speedApS = Math.min(maxSpeed, Math.max(minSpeed, stepped));
+		speedSlider.value = String(speedApS);
+		speedNumberInput.value = String(speedApS);
+		localStorage.setItem('tm.speed', String(speedApS));
+		renderDirty = true;
+	}
 
 	playButton.addEventListener('click', () => {
-		setPlaying(!playing);
-		if (playing) {
-			lastTimestamp = Date.now(); // Start timing immediately
-		} else {
-			lastTimestamp = null; // Stop timing
+		if (Math.floor(Math.random() * 100) === 0) {
+			window.location.href = 'https://www.youtube.com/watch?v=dQw4w9WgXcQ';
+			return;
 		}
+
+		playing = !playing;
+		const playPauseIcon = document.getElementById('playPauseIcon') as HTMLImageElement;
+		if (playPauseIcon) playPauseIcon.src = playing ? '/assets/ui-svgs/pause.svg' : '/assets/ui-svgs/play.svg';
+		lastTimestamp = playing ? Date.now() : null;
 	});
 
 	nextTickButton.addEventListener('click', () => {
-		if (tick < getTotalTicks() - 1) {
-			setTick(tick + 1);
+		if (tick < total - 1) {
+			tick += 1;
 			tickProgress = 0;
+			tickTimelineSlider.value = String(tick);
+			tickTimelineNumberInput.value = String(tick);
+			renderDirty = true;
 		}
 	});
 	prevTickButton.addEventListener('click', () => {
 		if (tick > 0) {
-			setTick(tick - 1);
+			tick -= 1;
 			tickProgress = 0;
+			tickTimelineSlider.value = String(tick);
+			tickTimelineNumberInput.value = String(tick);
+			renderDirty = true;
 		}
 	});
-
 	skipStartButton.addEventListener('click', () => {
-		setTick(0);
+		tick = 0;
 		tickProgress = 0;
+		tickTimelineSlider.value = '0';
+		tickTimelineNumberInput.value = '0';
+		renderDirty = true;
 	});
 	skipEndButton.addEventListener('click', () => {
-		const totalTicks = getTotalTicks();
-		if (totalTicks > 0) {
-			setTick(totalTicks - 1);
-		}
+		tick = total - 1;
 		tickProgress = 1;
+		tickTimelineSlider.value = String(tick);
+		tickTimelineNumberInput.value = String(tick);
+		renderDirty = true;
 	});
 
 	tickTimelineSlider.addEventListener('input', () => {
-		setTick(parseInt(tickTimelineSlider.value, 10));
+		const v = Math.min(total - 1, Math.max(0, parseInt(tickTimelineSlider.value, 10)));
+		if (!Number.isNaN(v)) {
+			tick = v;
+			tickTimelineSlider.value = String(tick);
+			tickTimelineNumberInput.value = String(tick);
+			tickProgress = 0;
+			renderDirty = true;
+		}
 	});
 	tickTimelineNumberInput.addEventListener('input', () => {
-		const value = parseInt(tickTimelineNumberInput.value, 10);
-		if (!Number.isNaN(value) && value >= 0 && value < getTotalTicks()) {
-			setTick(value);
+		const v = Math.min(total - 1, Math.max(0, parseInt(tickTimelineNumberInput.value, 10)));
+		if (!Number.isNaN(v)) {
+			tick = v;
+			tickTimelineSlider.value = String(tick);
+			tickTimelineNumberInput.value = String(tick);
+			tickProgress = 0;
+			renderDirty = true;
 		}
 	});
 
 	speedSlider.addEventListener('input', () => {
-		const value = parseFloat(speedSlider.value);
-		if (!Number.isNaN(value) && value > 0) {
-			speedApS = value;
-			speedNumberInput.value = speedApS.toString();
-		}
+		const v = parseFloat(speedSlider.value);
+		if (!Number.isNaN(v)) setSpeedLocal(v);
 	});
 	speedNumberInput.addEventListener('input', () => {
-		const value = parseFloat(speedNumberInput.value);
-		if (!Number.isNaN(value) && value > 0) {
-			speedApS = value;
-			speedSlider.value = speedApS.toString();
-		}
+		const v = parseFloat(speedNumberInput.value);
+		if (!Number.isNaN(v)) setSpeedLocal(v);
 	});
-	speedUpButton.addEventListener('click', () => {
-		if (speedApS < maxSpeed) {
-			speedApS += speedIncrement;
-			speedNumberInput.value = speedApS.toString();
-			speedSlider.value = speedApS.toString();
-		}
-	});
-	speedDownButton.addEventListener('click', () => {
-		if (speedApS > minSpeed) {
-			speedApS -= speedIncrement;
-			speedNumberInput.value = speedApS.toString();
-			speedSlider.value = speedApS.toString();
-		}
-	});
-
-	function adjustSpeed(delta: number) {
-		const newSpeed = Math.min(20, Math.max(1, speedApS + delta));
-		speedNumberInput.value = newSpeed.toString();
-		speedSlider.value = newSpeed.toString();
-		speedApS = newSpeed;
-	}
+	speedUpButton.addEventListener('click', () => setSpeedLocal(speedApS + speedIncrement));
+	speedDownButton.addEventListener('click', () => setSpeedLocal(speedApS - speedIncrement));
 
 	const keyBindings: Record<string, { action: () => void; button?: HTMLButtonElement }> = {
 		' ': { action: () => playButton.click(), button: playButton },
@@ -155,36 +171,47 @@ export async function setupTimeManager() {
 		e: { action: () => skipEndButton.click(), button: skipEndButton },
 		ArrowRight: { action: () => nextTickButton.click(), button: nextTickButton },
 		ArrowLeft: { action: () => prevTickButton.click(), button: prevTickButton },
-		ArrowUp: { action: () => adjustSpeed(+0.5), button: speedUpButton },
-		ArrowDown: { action: () => adjustSpeed(-0.5), button: speedDownButton },
+		ArrowUp: { action: () => setSpeedLocal(speedApS + speedIncrement), button: speedUpButton },
+		ArrowDown: { action: () => setSpeedLocal(speedApS - speedIncrement), button: speedDownButton },
 	};
 
 	window.addEventListener('keydown', (event) => {
 		if (event.ctrlKey || event.metaKey || event.altKey) return;
 		if (['INPUT', 'TEXTAREA', 'SELECT'].includes((event.target as HTMLElement).tagName)) return;
-
 		const binding = keyBindings[event.key];
 		if (!binding) return;
-
 		if (binding.button) {
 			binding.button.classList.add('active');
-			setTimeout(() => binding.button!.classList.remove('active'), 100);
+			setTimeout(() => {
+				if (binding.button) binding.button.classList.remove('active');
+			}, 100);
 		}
-
 		binding.action();
 		event.preventDefault();
+	});
+
+	window.addEventListener('pageshow', () => {
+		const max = Math.max(1, getTotalTicks()) - 1;
+		if (tick > max) tick = 0;
+		tickTimelineSlider.max = String(max);
+		tickTimelineNumberInput.max = String(max);
+		tickTimelineSlider.value = String(tick);
+		tickTimelineNumberInput.value = String(tick);
+		speedSlider.value = String(speedApS);
+		speedNumberInput.value = String(speedApS);
 	});
 }
 
 export function getCurrentTickData(): tickData {
 	if (winnerDisplay) {
-		if (tick == getTotalReplayTicks() - 1) {
-			document.querySelectorAll<HTMLElement>('.win-display').forEach((elem) => (elem.style.display = 'block'));
-			setRenderFireworks(true);
-		} else {
-			document.querySelectorAll<HTMLElement>('.win-display').forEach((elem) => (elem.style.display = 'none'));
-			setRenderFireworks(false);
-		}
+		const total = getTotalReplayTicks();
+		const atEnd = total === 0 || tick === total - 1;
+
+		document.querySelectorAll<HTMLElement>('.win-display').forEach((elem) => {
+			elem.style.display = atEnd ? 'block' : 'none';
+		});
+
+		setRenderFireworks(atEnd);
 	}
 
 	const now = Date.now();
@@ -199,6 +226,7 @@ export function getCurrentTickData(): tickData {
 	const dt = (now - lastTimestamp) / 1000; // seconds elapsed
 	lastTimestamp = now;
 	const delta = dt * speedApS * (playing ? 1 : 0);
+	if (delta !== 0) renderDirty = true;
 	tickProgress += delta;
 
 	if (tickProgress > 1) {
@@ -213,6 +241,10 @@ export function getCurrentTickData(): tickData {
 	}
 
 	return { tick, tickProgress };
+}
+
+export function isDirty(): boolean {
+	return renderDirty;
 }
 
 export function resetTimeManager() {

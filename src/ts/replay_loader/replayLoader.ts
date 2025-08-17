@@ -1,16 +1,21 @@
-import { initializeTeamMapping } from '../renderer/renderer.js';
+import { setupRenderer } from '../renderer/renderer.js';
 import { resetTimeManager } from '../time_manager/timeManager.js';
 import type { TickAction } from './action.js';
 import type { GameConfig } from './config.js';
 import type { TickObject } from './object.js';
 
+const expectedReplayVersion = '1.1.1';
 const winnerNameElement = document.getElementById('winnername') as HTMLSpanElement;
 const winReasonElement = document.getElementById('winreason') as HTMLSpanElement;
-const gameEndReasons: Record<number, string> = {
-	0: 'Core Destruction',
-	1: 'Game Timed Out - Decision via Core HP',
-	2: 'Game Timed Out - Decision via Total Unit HP',
-	3: 'Game Timed Out - Random Decision',
+const deathReasons: Record<number, string> = {
+	0: 'Survived',
+	1: 'Core destruction',
+	2: 'Unexpectedly Disconnected',
+	3: 'Did not connect to gameserver',
+	4: 'Timeout while sending data',
+	5: 'Game timed out - Decision via Core HP',
+	6: 'Game timed out - Decision via Unit HP',
+	7: 'Game timed out - Random Decision',
 };
 
 export interface ReplayTick {
@@ -20,18 +25,27 @@ export interface ReplayTick {
 
 export interface ReplayData {
 	misc: {
-		team_results: { id: number; name: string; place: number }[];
-		game_end_reason: number;
+		team_results: { id: number; name: string; place: number; death_reason: number }[];
+		version: string;
+		worldGeneratorSeed: number;
 	};
 	ticks: { [tick: string]: ReplayTick };
 	full_tick_amount: number;
 	config?: GameConfig;
 }
+const emptyReplayData: ReplayData = {
+	misc: {
+		team_results: [],
+		version: '',
+		worldGeneratorSeed: 0,
+	},
+	ticks: {},
+	full_tick_amount: 0,
+};
 
 type State = Record<number, TickObject>;
 type ReplayMisc = {
-	team_results: { id: number; name: string; place: number }[];
-	game_end_reason: number;
+	team_results: { id: number; name: string; place: number; death_reason: number }[];
 };
 
 export let totalReplayTicks = 0;
@@ -42,8 +56,16 @@ function deepClone<T>(obj: T): T {
 	return JSON.parse(JSON.stringify(obj));
 }
 
+function forceHttps(url: string): string {
+	const u = new URL(url, location.href);
+	if (location.protocol === 'https:' && u.protocol !== 'https:') {
+		u.protocol = 'https:';
+	}
+	return u.toString();
+}
+
 class ReplayLoader {
-	private replayData: ReplayData = { misc: { team_results: [], game_end_reason: 0 }, ticks: {}, full_tick_amount: 0 };
+	private replayData: ReplayData = emptyReplayData;
 	private cache: Map<number, State> = new Map<number, State>();
 	private cacheInterval: number;
 
@@ -54,7 +76,7 @@ class ReplayLoader {
 	public async loadReplay(filePath: string): Promise<void> {
 		let fileData: string | null = replayDataOverride;
 		if (!fileData) {
-			await fetch(filePath, { cache: 'no-cache' })
+			await fetch(forceHttps(filePath), { cache: 'no-cache' })
 				.then((response) => {
 					if (!response.ok) {
 						throw new Error(`Failed to fetch replay file: ${response.statusText}`);
@@ -74,13 +96,22 @@ class ReplayLoader {
 		}
 
 		this.replayData = JSON.parse(fileData) as ReplayData;
-		if (!this.replayData.ticks || !this.replayData.full_tick_amount) {
+		if (!this.replayData.ticks || typeof this.replayData.full_tick_amount !== 'number') {
 			throw new Error('Invalid replay data format: missing ticks or full_tick_amount');
+		}
+		if (this.replayData.misc.version !== expectedReplayVersion) {
+			alert('Unsupported replay version. Things might stop working unexpectedly.');
+			console.error(`Expected version: ${expectedReplayVersion}, but got: ${this.replayData.misc.version}`);
 		}
 		totalReplayTicks = this.replayData.full_tick_amount;
 
 		winnerNameElement.innerHTML = this.replayData.misc.team_results.find((team) => team.place === 0)?.name || 'Unknown';
-		winReasonElement.innerHTML = gameEndReasons[this.replayData.misc.game_end_reason] || 'Unknown Reason';
+		winReasonElement.innerHTML = '';
+		for (const team of this.replayData.misc.team_results) {
+			if (team.place === 0) continue;
+			const teamName = team.name || `Team ${team.id}`;
+			winReasonElement.innerHTML += `Place ${team.place + 1}: ${teamName} (Death Reason: ${deathReasons[team.death_reason]})<br>`;
+		}
 
 		const fullState: State = {};
 		const tick0 = this.replayData.ticks['0'];
@@ -95,6 +126,9 @@ class ReplayLoader {
 			const tickData = this.replayData.ticks[t.toString()];
 			if (tickData?.objects) {
 				this.applyDiff(fullState, tickData);
+			}
+			for (const obj of Object.values(fullState)) {
+				if ('moveCooldown' in obj && obj.moveCooldown > 0) obj.moveCooldown--;
 			}
 			if (t % this.cacheInterval === 0) {
 				this.cache.set(t, deepClone(fullState));
@@ -176,7 +210,7 @@ class ReplayLoader {
 	}
 
 	public resetReplayData() {
-		this.replayData = { misc: { team_results: [], game_end_reason: 0 }, ticks: {}, full_tick_amount: 0 };
+		this.replayData = emptyReplayData;
 	}
 
 	public getGameConfig(): GameConfig | undefined {
@@ -191,18 +225,39 @@ class ReplayLoader {
 let replayLoader: ReplayLoader | null = null;
 let replayInterval: ReturnType<typeof setInterval> | null = null;
 
-// loads replay and sets up periodic updates
-export async function setupReplayLoader(filePath: string, cacheInterval = 25, updateInterval = 3000): Promise<void> {
-	replayLoader = new ReplayLoader(cacheInterval);
+let currentFilePath: string | null = null;
+let currentCacheInterval = 25;
+let lastEtag: string | null = null;
 
-	// initial load
-	await replayLoader.loadReplay(filePath);
+async function resetReplay(reason: string = 'reset'): Promise<void> {
+	if (!currentFilePath) {
+		throw new Error('No file path set for replay.');
+	}
+	const newReplayLoader = new ReplayLoader(currentCacheInterval);
+	await newReplayLoader.loadReplay(currentFilePath);
+	replayLoader = newReplayLoader;
+	tempStateCache = null;
+	resetTimeManager();
+	setupRenderer();
+	console.debug(`Replay reset (${reason}). override=${Boolean(replayDataOverride)} etag=${lastEtag}`);
+}
+
+export async function setupReplayLoader(filePath: string, cacheInterval = 25, updateInterval = 3000): Promise<void> {
+	currentFilePath = filePath;
+	currentCacheInterval = cacheInterval;
+
+	// initial load (via central reset)
+	await resetReplay('initial');
 
 	// grab initial ETag
-	let lastEtag: string | null = null;
+	lastEtag = null;
 	try {
-		const headRes = await fetch(filePath, { method: 'HEAD', cache: 'no-cache' });
-		lastEtag = headRes.headers.get('ETag');
+		const headRes = await fetch(forceHttps(filePath), { method: 'HEAD', cache: 'no-cache' });
+		if (headRes.ok) {
+			lastEtag = headRes.headers.get('ETag');
+		} else {
+			console.warn('Failed to fetch initial ETag:', headRes.status, headRes.statusText);
+		}
 	} catch (err) {
 		console.warn('Failed to fetch initial ETag:', err);
 	}
@@ -212,12 +267,12 @@ export async function setupReplayLoader(filePath: string, cacheInterval = 25, up
 		clearInterval(replayInterval);
 	}
 	replayInterval = setInterval(async () => {
-		if (replayDataOverride) return;
+		if (!currentFilePath) return;
 		try {
-			const head = await fetch(filePath, { method: 'HEAD', cache: 'no-cache' });
+			const head = await fetch(forceHttps(currentFilePath), { method: 'HEAD', cache: 'no-cache' });
 
 			if (!head.ok) {
-				throw 'catch block time - lets reset the replayLoader';
+				console.error('Couldnt fetch current replay etag.');
 			}
 
 			const etag = head.headers.get('ETag');
@@ -226,17 +281,17 @@ export async function setupReplayLoader(filePath: string, cacheInterval = 25, up
 				return;
 			}
 
+			// if ETag changes, clear local override and reset via the single path
 			if (etag !== lastEtag) {
 				lastEtag = etag;
-				const newReplayLoader = new ReplayLoader(cacheInterval);
-				await newReplayLoader.loadReplay(filePath);
-				replayLoader = newReplayLoader;
-				initializeTeamMapping();
-				resetTimeManager();
+				// make override non-permanent: clear it on remote update
+				if (replayDataOverride) {
+					replayDataOverride = null;
+				}
+				await resetReplay('etag-change');
 			}
 		} catch (err) {
 			console.error('Error checking for updates:', err);
-			replayLoader = null;
 		}
 	}, updateInterval);
 }
@@ -358,10 +413,7 @@ window.addEventListener('drop', (e) => {
 		if (contents) {
 			console.log('File loaded successfully');
 			replayDataOverride = contents;
-			const newReplayLoader = new ReplayLoader(25);
-			await newReplayLoader.loadReplay('dummy.json');
-			replayLoader = newReplayLoader;
-			resetTimeManager();
+			await resetReplay('file-drop');
 		}
 	};
 	alert('File loaded successfully, please refresh the page to see the changes.');
