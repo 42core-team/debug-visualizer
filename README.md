@@ -1,5 +1,7 @@
 # Debug Visualizer
 
+> ## THIS WAS ARCHIVED because we shifted towards a monorepo architecture. Please check out the monorepo repo in our orga to find the visualizer.
+
 -   `npm run serve` -> Run visualizer under `localhost:8080`
 -   `npm run dev` -> Run dev mode, no need to manually recompile the ts
 -   `npm run build` -> Build ts files into servable js files
